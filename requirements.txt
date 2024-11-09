@@ -8,3 +8,6 @@ blobfile
 protobuf 
 sentencepiece
 accelerate>=0.26.0
+ipykernel
+jupyter
+ipywidgets==7.7.1
