@@ -31,25 +31,15 @@ def sample_top_p(probs, p, return_tokens=0):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
-def generate(model, tokenizer, text, max_new_tokens=5, do_sample=False, temperature=None, top_p=None):
+def generate(model, tokenizer, text, max_new_tokens=5, do_sample=False, temperature=None, top_p=1, top_k=None):
     text = list(text)
     inputs = tokenizer(text, return_tensors="pt", padding=True).to(model.device)
     _, input_length = inputs["input_ids"].shape
     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature, 
-                             top_p=top_p, pad_token_id=tokenizer.eos_token_id, output_scores=True)
+                             top_p=top_p, top_k=top_k, pad_token_id=tokenizer.eos_token_id)
     answers = tokenizer.batch_decode(outputs[:, input_length:], skip_special_tokens=True)
-    return outputs, answers
+    return answers
 
-def generate_from_tokens(model, tokenizer, inputs, max_new_tokens=5, do_sample=False, temperature=None, top_p=None):
-    outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature, 
-                             top_p=top_p, pad_token_id=tokenizer.eos_token_id, output_scores=True)
-    answers = tokenizer.batch_decode(outputs, skip_special_tokens=True)
-    return outputs, answers
-
-
-def tokenize(tokenizer, text, device):
-    inputs = tokenizer(text, return_tensors="pt", padding=True).to(device)
-    return inputs
 
 def get_logits(model, inputs):
     with torch.no_grad():
@@ -78,7 +68,7 @@ def calc_perplexity(total_tokens, model, batch_size=16):
     # TODO: total_tokens are mostly the same sentence at the beginning. it might make sense to calculate hidden states for the beginning of the sentence only once
     # calculate perplexity in batches
     cross_entropy = torch.nn.CrossEntropyLoss(reduction='none')
-    perplexity = []
+    perplexities = []
     for input_ids_batch, input_attention_mask_batch in zip(batchify(total_tokens['input_ids'], batch_size), batchify(total_tokens['attention_mask'], 16)):
 
         batch = {'input_ids': input_ids_batch, 'attention_mask': input_attention_mask_batch}
@@ -89,20 +79,21 @@ def calc_perplexity(total_tokens, model, batch_size=16):
         attention_mask = batch['attention_mask'][:, 1:].contiguous()
         # Compute loss for each token (not averaged)
         per_token_loss = cross_entropy(
-            logits.view(-1, logits.size(-1)), 
-            labels.view(-1)
-        ).view(batch['input_ids'].size(0), -1) 
+            rearrange(logits, 'b t c -> (b t) c'),
+            rearrange(labels, 'b t -> (b t)')
+            )
+        per_token_loss = rearrange(per_token_loss, '(b t) -> b t', b=batch['input_ids'].size(0))
 
         # Mask padding tokens
         per_token_loss = per_token_loss * attention_mask  # Zero-out loss for padding
 
         # Sum the loss over the sequence
-        loss = per_token_loss.sum(dim=-1)/attention_mask.sum(dim=-1)
-        perplexity.extend(loss.cpu().detach())
+        seq_loss = per_token_loss.sum(dim=-1)/(attention_mask.sum(dim=-1) + 1e-8)
+        perplexities.extend(torch.exp(seq_loss).detach().cpu())
 
-    return torch.tensor(perplexity)
+    return torch.tensor(perplexities)
 
-def generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=False, top_p=0.9, top_k=50, temperature=1.0, k=15):
+def generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=True, top_p=1, top_k=None, temperature=1.0, k=15):
     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature, 
                          pad_token_id=tokenizer.eos_token_id, output_scores=True, return_dict_in_generate=True, top_k=top_k, top_p=top_p)
 
@@ -129,21 +120,22 @@ def generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=Fa
     return {'input_ids': input_ids_expanded, 'attention_mask': attention_mask_expanded}
     
 
-def choose_best_candidate(input_ids, perplexity, best_k, out_of, device):
-    # choose the best candidate
+def choose_best_candidate(inputs, perplexity, best_k, out_of, device):
+
     perplexity = rearrange(perplexity, '(b r) -> b r', r=out_of)
+    # indices corresponding to the lowest perplexity
     best_k_indices = torch.topk(perplexity, best_k, dim=1, largest=False).indices
-    input_ids['input_ids'] = rearrange(input_ids['input_ids'], '(b r) t -> b r t', r=out_of)
-    input_ids['attention_mask'] = rearrange(input_ids['attention_mask'], '(b r) t -> b r t', r=out_of)
+    inputs['input_ids'] = rearrange(inputs['input_ids'], '(b r) t -> b r t', r=out_of)
+    inputs['attention_mask'] = rearrange(inputs['attention_mask'], '(b r) t -> b r t', r=out_of)
 
     # apply k1_lowest_indices
-    token_dim = input_ids['input_ids'].shape[-1]
-    expanded_indices = best_k_indices.unsqueeze(-1).expand(-1, -1, token_dim)
-    selected_input_ids = torch.gather(input_ids['input_ids'], dim=1, index=expanded_indices.to(device))
-    selected_attention_mask = torch.gather(input_ids['attention_mask'], dim=1, index=expanded_indices.to(device))
+    token_dim = inputs['input_ids'].shape[-1]
+    expanded_indices = repeat(best_k_indices, 'b k -> b k d', d=token_dim)    
+    selected_input_ids = torch.gather(inputs['input_ids'], dim=1, index=expanded_indices.to(device))
+    selected_attention_mask = torch.gather(inputs['attention_mask'], dim=1, index=expanded_indices.to(device))
 
     # reshape
-    input_ids['input_ids'] = rearrange(selected_input_ids, 'b r t -> (b r) t')
-    input_ids['attention_mask'] = rearrange(selected_attention_mask, 'b r t -> (b r) t')
+    inputs['input_ids'] = rearrange(selected_input_ids, 'b r t -> (b r) t')
+    inputs['attention_mask'] = rearrange(selected_attention_mask, 'b r t -> (b r) t')
 
-    return input_ids
+    return inputs
