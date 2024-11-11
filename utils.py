@@ -65,32 +65,29 @@ def batchify(lst, batch_size):
     for i in range(0, len(lst), batch_size):
         yield lst[i:i + batch_size]
 
-def calc_perplexity(total_tokens, model, batch_size=16):
+def calc_perplexity(input_tokens, total_tokens, model, batch_size=16):
     # TODO: total_tokens are mostly the same sentence at the beginning. it might make sense to calculate hidden states for the beginning of the sentence only once
     # calculate perplexity in batches
-    cross_entropy = torch.nn.CrossEntropyLoss(reduction='none')
     perplexities = []
+
+    sl_input_tokens = input_tokens['input_ids'].shape[1]
+    
     for input_ids_batch, input_attention_mask_batch in zip(batchify(total_tokens['input_ids'], batch_size), batchify(total_tokens['attention_mask'], 16)):
 
+
+        num_samples, sl_total_tokens = input_ids_batch.shape
         batch = {'input_ids': input_ids_batch, 'attention_mask': input_attention_mask_batch}
         logits = model(**batch, return_dict=True).logits
         # exclude last token from perplexity calculation
-        logits = logits[:, :-1].contiguous() 
-        labels = batch['input_ids'][:, 1:].contiguous()
-        attention_mask = batch['attention_mask'][:, 1:].contiguous()
-        # Compute loss for each token (not averaged)
-        per_token_loss = cross_entropy(
-            rearrange(logits, 'b t c -> (b t) c'),
-            rearrange(labels, 'b t -> (b t)')
-            )
-        per_token_loss = rearrange(per_token_loss, '(b t) -> b t', b=batch['input_ids'].size(0))
+        softmax = torch.nn.Softmax(dim=-1)
 
-        # Mask padding tokens
-        per_token_loss = per_token_loss * attention_mask  # Zero-out loss for padding
+        # Calculate log probabilities in a vectorized manner
+        log_probs = -torch.log(softmax(logits))
+        target_positions = torch.arange(sl_input_tokens, sl_total_tokens)
+        logs = log_probs[torch.arange(num_samples)[:, None], target_positions - 1, input_ids_batch[:, target_positions]].sum(dim=1)
+        perp = torch.exp(logs / (sl_total_tokens - sl_input_tokens))
 
-        # Sum the loss over the sequence
-        seq_loss = per_token_loss.sum(dim=-1)/(attention_mask.sum(dim=-1) + 1e-8)
-        perplexities.extend(torch.exp(seq_loss).detach().cpu())
+        perplexities.extend(perp.detach().cpu())
 
     return torch.tensor(perplexities)
 
@@ -113,7 +110,7 @@ def generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=Tr
     adv_tokens = sample_top_p(valid_probs, top_p, return_tokens=k)
 
     # add the new tokens to the input
-    # Repeat input_ids and rearrange curr_tokens to match dimensions
+    # Repeat input_ids and rearrange adv_tokens to match dimensions
     input_ids_expanded = repeat(inputs['input_ids'], 'b t -> b r t', r=k) 
     attention_mask_expanded = repeat(inputs['attention_mask'], 'b t -> b r t', r=k)  
     adv_tokens_expanded = rearrange(adv_tokens, 'b r -> b r 1')  
@@ -134,7 +131,8 @@ def choose_best_candidate(inputs, perplexity, best_k, out_of, device):
 
     perplexity = rearrange(perplexity, '(b r) -> b r', r=out_of)
     # indices corresponding to the lowest perplexity
-    best_k_indices = torch.topk(perplexity, best_k, dim=1, largest=False).indices
+    best_k_perplexity, best_k_indices = torch.topk(perplexity, best_k, dim=1, largest=False)
+
     inputs['input_ids'] = rearrange(inputs['input_ids'], '(b r) t -> b r t', r=out_of)
     inputs['attention_mask'] = rearrange(inputs['attention_mask'], '(b r) t -> b r t', r=out_of)
 
@@ -174,14 +172,18 @@ def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead
         # create total tokens input_tokens (with adv_tokens) + assistant_tokens + target_tokens
         total_tokens['input_ids'] = torch.cat([inputs['input_ids'], assistant_tokens_expanded, target_tokens_expanded], dim=-1)
         total_tokens['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones_like(assistant_tokens_expanded), torch.ones_like(target_tokens_expanded)], dim=-1)
-
+        # add assistant token to inputs
+        inputs_with_assistant = {}
+        inputs_with_assistant['input_ids'] = torch.cat([inputs['input_ids'], assistant_tokens_expanded], dim=-1)
+        inputs_with_assistant['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones_like(assistant_tokens_expanded)], dim=-1)
         # calculate perplexity
-        perplexity = calc_perplexity(total_tokens, model, batch_size=batch_size)
+        perplexity = calc_perplexity(inputs_with_assistant, total_tokens, model, batch_size=batch_size)
 
         # choose the best candidate
         inputs = choose_best_candidate(inputs, perplexity, best_k=k1, out_of=k1*k2, device=device)
 
-    perplexity = calc_perplexity(inputs, model, batch_size=batch_size)
+    total_tokens = choose_best_candidate(total_tokens, perplexity, best_k=1, out_of=k1, device=device)
+    perplexity = calc_perplexity(inputs, total_tokens, model, batch_size=batch_size)
     final_attack = choose_best_candidate(inputs, perplexity, best_k=1, out_of=k1, device=device)
     final_attack_sentences = tokenizer.batch_decode(final_attack['input_ids'], skip_special_tokens=True)
 
