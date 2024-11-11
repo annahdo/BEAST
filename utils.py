@@ -1,13 +1,14 @@
 import torch
 import torch.nn.functional as F
 from einops import repeat, rearrange
+from tqdm import tqdm
 
 def prepare_input(chat_format, sens):        
     # assert only one user-assistant dialog
     # empty list of size len(sens)
     formated_sens = [0] * len(sens)
     for i in range(len(sens)):
-        formated_sens[i] = "{}{}{}{}".format(chat_format['sep'][0], chat_format['user'][0], sens[i].strip(" "), chat_format['assistant'][0])
+        formated_sens[i] = "{}{}{}{}".format(chat_format['system'], chat_format['user'], sens[i].strip(" "), chat_format['assistant'])
 
     return formated_sens
 
@@ -51,10 +52,10 @@ def get_target_tokens(tokenizer, targets, lookahead_length):
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "right"
     target_tokens = []
-    target_tokens = tokenizer(targets, return_tensors="pt", padding=True, truncation=True)
+    target_tokens = tokenizer(targets, return_tensors="pt", padding=True, truncation=True, add_special_tokens=False)
     # reduce to lookahead_length, delete bos token
-    target_tokens['input_ids'] = target_tokens['input_ids'][:, 1:1+lookahead_length]
-    target_tokens['attention_mask'] = target_tokens['attention_mask'][:, 1:1+lookahead_length]
+    target_tokens['input_ids'] = target_tokens['input_ids'][:, :lookahead_length]
+    target_tokens['attention_mask'] = target_tokens['attention_mask'][:, :lookahead_length]
     # TODO check if bos token should be deleted
     tokenizer.padding_side = original_padding_side
     return target_tokens
@@ -94,24 +95,33 @@ def calc_perplexity(total_tokens, model, batch_size=16):
     return torch.tensor(perplexities)
 
 def generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=True, top_p=1, top_k=None, temperature=1.0, k=15):
+    # TODO could maybe replace by just forward pass
     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature, 
                          pad_token_id=tokenizer.eos_token_id, output_scores=True, return_dict_in_generate=True, top_k=top_k, top_p=top_p)
 
     logits = outputs.scores[0]
-    probs = torch.softmax(logits, dim=-1)
+    probs = torch.softmax(logits, dim=-1) 
 
-    curr_tokens = sample_top_p(probs, top_p, return_tokens=k)
+    # make sure not to append special tokens
+    # TODO an alternative workaround would be not hardcode the attention mask to ones but set attention for special tokens to 0
+    special_ids = tokenizer.all_special_ids  # List of all special token IDs
+    valid_probs = probs.clone()
+    valid_probs[:, special_ids] = 0  # Set probabilities of special tokens to 0
+    valid_probs /= valid_probs.sum(dim=-1, keepdim=True)  # Renormalize probabilities
+
+    # Sample valid tokens
+    adv_tokens = sample_top_p(valid_probs, top_p, return_tokens=k)
 
     # add the new tokens to the input
     # Repeat input_ids and rearrange curr_tokens to match dimensions
     input_ids_expanded = repeat(inputs['input_ids'], 'b t -> b r t', r=k) 
     attention_mask_expanded = repeat(inputs['attention_mask'], 'b t -> b r t', r=k)  
-    curr_tokens_expanded = rearrange(curr_tokens, 'b r -> b r 1')  
-    curr_attentions_expanded = torch.ones_like(curr_tokens_expanded) 
+    adv_tokens_expanded = rearrange(adv_tokens, 'b r -> b r 1')  
+    adv_attentions_expanded = torch.ones_like(adv_tokens_expanded) 
 
     # Concatenate along the last dimension
-    input_ids_expanded = torch.cat([input_ids_expanded, curr_tokens_expanded], dim=-1)  
-    attention_mask_expanded = torch.cat([attention_mask_expanded, curr_attentions_expanded], dim=-1)  
+    input_ids_expanded = torch.cat([input_ids_expanded, adv_tokens_expanded], dim=-1)  
+    attention_mask_expanded = torch.cat([attention_mask_expanded, adv_attentions_expanded], dim=-1)  
 
     # Reshape to desired shape
     input_ids_expanded = rearrange(input_ids_expanded, 'b r t -> (b r) t')  
@@ -139,3 +149,40 @@ def choose_best_candidate(inputs, perplexity, best_k, out_of, device):
     inputs['attention_mask'] = rearrange(selected_attention_mask, 'b r t -> (b r) t')
 
     return inputs
+
+
+def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead_length, num_adv_tokens, do_sample, temperature, top_p, top_k, k1, k2, batch_size):
+    device = model.device
+
+    target_tokens = get_target_tokens(tokenizer, targets, lookahead_length).to(device)
+    target_tokens_expanded = repeat(target_tokens['input_ids'], 'b t -> b r t', r=k1*k2)
+    target_tokens_expanded = rearrange(target_tokens_expanded, 'b r t -> (b r) t')
+
+    assistant_token = torch.tensor(tokenizer.encode(assistant_string, add_special_tokens=False)).to(device)
+    assistant_tokens_expanded = repeat(assistant_token, 't -> b t', b=target_tokens_expanded.shape[0])
+
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(model.device)
+
+    inputs = generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, k=k1)
+
+    for _ in tqdm(range(1, num_adv_tokens), desc="Adversarial Token Generation"):
+            
+        inputs = generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, k=k2)
+        # extend input_ids with target tokens
+        total_tokens = {}        
+
+        # create total tokens input_tokens (with adv_tokens) + assistant_tokens + target_tokens
+        total_tokens['input_ids'] = torch.cat([inputs['input_ids'], assistant_tokens_expanded, target_tokens_expanded], dim=-1)
+        total_tokens['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones_like(assistant_tokens_expanded), torch.ones_like(target_tokens_expanded)], dim=-1)
+
+        # calculate perplexity
+        perplexity = calc_perplexity(total_tokens, model, batch_size=batch_size)
+
+        # choose the best candidate
+        inputs = choose_best_candidate(inputs, perplexity, best_k=k1, out_of=k1*k2, device=device)
+
+    perplexity = calc_perplexity(inputs, model, batch_size=batch_size)
+    final_attack = choose_best_candidate(inputs, perplexity, best_k=1, out_of=k1, device=device)
+    final_attack_sentences = tokenizer.batch_decode(final_attack['input_ids'], skip_special_tokens=True)
+
+    return final_attack_sentences
