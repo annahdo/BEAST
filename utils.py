@@ -208,6 +208,7 @@ def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead
         
         # create total_tokens: input_tokens (with adv_tokens) + assistant_tokens + target_tokens
         total_tokens = choose_best_candidate(copy.deepcopy(total_tokens), perplexity, best_k=k1, out_of=k1*k2, device=device)
+        inputs_with_assistant = choose_best_candidate(copy.deepcopy(inputs_with_assistant), perplexity, best_k=k1, out_of=k1*k2, device=device)
         perplexity = calc_perplexity(inputs_with_assistant, total_tokens, model, batch_size=batch_size)
         # choose best out of k1 beams
         final_inputs = choose_best_candidate(inputs, perplexity, best_k=1, out_of=k1, device=device)
