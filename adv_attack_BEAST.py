@@ -35,6 +35,9 @@ def main(args):
     data = pd.read_csv(args.data_file)
     prompts = list(data[args.prompt_tag])
     targets = list(data[args.target_tag])
+    if args.num_data_points is not None:
+        prompts = prompts[:args.num_data_points]
+        targets = targets[:args.num_data_points]
 
     # Generate attacked prompts
     chat_format_attack = deepcopy(chat_format)
@@ -67,7 +70,7 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Command-line application for adversarial prompt generation.")
+    parser = argparse.ArgumentParser(description="Command-line application for adversarial prompt generation using BEAST.")
 
     # Model and tokenizer arguments
     parser.add_argument("--model_name", type=str, default="lmsys/vicuna-7b-v1.5", help="Name of the model to load.")
@@ -76,6 +79,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_file", type=str, default="data/harmful_behaviors.csv", help="Path to the CSV data file.")
     parser.add_argument("--prompt_tag", type=str, default="goal", help="Column name for prompts in the CSV file.")
     parser.add_argument("--target_tag", type=str, default="target", help="Column name for targets in the CSV file.")
+    parser.add_argument("--num_data_points", type=int, default=None, help="Number of data points to consider.")
     
     # Attack parameters
     parser.add_argument("--top_k", type=int, default=None, help="Top k tokens to consider.")
@@ -84,7 +88,7 @@ if __name__ == "__main__":
     parser.add_argument("--k2", type=int, default=15, help="Number of candidates per candidate evaluated.")
     parser.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature. 0 means no sampling.")
     parser.add_argument("--num_adv_tokens", type=int, default=40, help="Number of adversarial tokens to add.")
-    parser.add_argument("--lookahead_length", type=int, default=10, help="Number of target tokens are used for objective.")
+    parser.add_argument("--lookahead_length", type=int, default=10, help="Number of target tokens used for objective.")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for generation.")
     
     args = parser.parse_args()

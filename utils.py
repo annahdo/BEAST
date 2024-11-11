@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 from einops import repeat, rearrange
 from tqdm import tqdm
+import copy
 
 def prepare_input(chat_format, sens):        
     # assert only one user-assistant dialog
@@ -151,6 +152,20 @@ def choose_best_candidate(inputs, perplexity, best_k, out_of, device):
 
     return inputs
 
+def extend_tokens(inputs, assistant_tokens_expanded, target_tokens_expanded):            
+    total_tokens = {}        
+    total_tokens['input_ids'] = torch.cat([inputs['input_ids'], assistant_tokens_expanded, target_tokens_expanded], dim=-1)
+    total_tokens['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones_like(assistant_tokens_expanded), torch.ones_like(target_tokens_expanded)], dim=-1)
+    
+    # add assistant token to inputs
+    inputs_with_assistant = {}
+    inputs_with_assistant['input_ids'] = torch.cat([inputs['input_ids'], assistant_tokens_expanded], dim=-1)
+    inputs_with_assistant['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones_like(assistant_tokens_expanded)], dim=-1)
+
+    return total_tokens, inputs_with_assistant
+    
+
+
 
 def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead_length, num_adv_tokens, do_sample, temperature, top_p, top_k, k1, k2, batch_size):
     device = model.device
@@ -182,14 +197,7 @@ def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead
             inputs = generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, k=k2)
             
             # create total_tokens: input_tokens (with adv_tokens) + assistant_tokens + target_tokens
-            total_tokens = {}        
-            total_tokens['input_ids'] = torch.cat([inputs['input_ids'], assistant_tokens_expanded, target_tokens_expanded], dim=-1)
-            total_tokens['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones_like(assistant_tokens_expanded), torch.ones_like(target_tokens_expanded)], dim=-1)
-            
-            # add assistant token to inputs
-            inputs_with_assistant = {}
-            inputs_with_assistant['input_ids'] = torch.cat([inputs['input_ids'], assistant_tokens_expanded], dim=-1)
-            inputs_with_assistant['attention_mask'] = torch.cat([inputs['attention_mask'], torch.ones_like(assistant_tokens_expanded)], dim=-1)
+            total_tokens, inputs_with_assistant = extend_tokens(inputs, assistant_tokens_expanded, target_tokens_expanded)
             
             # calculate perplexity
             perplexity = calc_perplexity(inputs_with_assistant, total_tokens, model, batch_size=batch_size)
@@ -197,16 +205,18 @@ def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead
             # choose the best candidate
             inputs = choose_best_candidate(inputs, perplexity, best_k=k1, out_of=k1*k2, device=device)
 
+        
+        # create total_tokens: input_tokens (with adv_tokens) + assistant_tokens + target_tokens
+        total_tokens = choose_best_candidate(copy.deepcopy(total_tokens), perplexity, best_k=k1, out_of=k1*k2, device=device)
+        perplexity = calc_perplexity(inputs_with_assistant, total_tokens, model, batch_size=batch_size)
         # choose best out of k1 beams
-        total_tokens = choose_best_candidate(total_tokens, perplexity, best_k=1, out_of=k1, device=device)
-        perplexity = calc_perplexity(inputs, total_tokens, model, batch_size=batch_size)
-        final_attack = choose_best_candidate(inputs, perplexity, best_k=1, out_of=k1, device=device)
+        final_inputs = choose_best_candidate(inputs, perplexity, best_k=1, out_of=k1, device=device)
 
         # extract pure adversarial tokens
-        final_attack_tokens = final_attack['input_ids'][:, -num_adv_tokens:].detach().cpu()
+        final_attack_tokens = final_inputs['input_ids'][:, -num_adv_tokens:].detach().cpu()
         all_attack_tokens = torch.cat([all_attack_tokens, final_attack_tokens], dim=0)
 
-        final_attack_sentences = tokenizer.batch_decode(final_attack['input_ids'], skip_special_tokens=True)
+        final_attack_sentences = tokenizer.batch_decode(final_inputs['input_ids'], skip_special_tokens=True)
         all_attack_sentences.extend(final_attack_sentences)
 
     return all_attack_sentences, all_attack_tokens
