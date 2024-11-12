@@ -69,7 +69,8 @@ def batchify(lst, batch_size):
         yield lst[i:i + batch_size]
 
 def calc_perplexity(input_tokens, total_tokens, model, batch_size=16):
-    # TODO: total_tokens are mostly the same sentence at the beginning. it might make sense to calculate hidden states for the beginning of the sentence only once
+    # TODO: total_tokens are mostly the same sentence at the beginning. 
+    # it might make sense to calculate hidden states for the beginning of the sentence only once
     # calculate perplexity in batches
     perplexities = []
 
@@ -96,6 +97,7 @@ def calc_perplexity(input_tokens, total_tokens, model, batch_size=16):
 
 def generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=True, top_p=1., top_k=None, temperature=1.0, k=15):
     # TODO could maybe replace by just forward pass
+    # TODO: total_tokens are mostly the same sentence at the beginning. it might make sense to calculate hidden states for the beginning of the sentence only once
     outputs = model.generate(**inputs, max_new_tokens=max_new_tokens, do_sample=do_sample, temperature=temperature, 
                          pad_token_id=tokenizer.eos_token_id, output_scores=True, return_dict_in_generate=True, top_k=top_k, top_p=top_p)
 
@@ -193,6 +195,8 @@ def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead
         inputs = generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, k=k1)
         
         for _ in tqdm(range(1, num_adv_tokens), desc="Adversarial Token Generation"):
+            # TODO: calc hidden states one for all beams up to beginning of adv token 
+            # then pass those hidden states to generate_and_extend and calc_perplexity
             
             # generate k2 candidates for each beam
             inputs = generate_and_extend(model, tokenizer, inputs, max_new_tokens=1, do_sample=do_sample, temperature=temperature, top_p=top_p, top_k=top_k, k=k2)
@@ -238,8 +242,7 @@ def evaluate_BEAST(model, tokenizer, adv_prompts, refusal_strings, batch_size, n
         for i in range(num_trials):
             # Generate attacked prompts
             responses_batch = generate(model, tokenizer, prompt_batch, max_new_tokens=num_gen_tokens, do_sample=do_sample, temperature=temperature)
-            # check if the response contains refusal strings
-                    # Check if each response contains any of the refusal strings
+            # Check if each response contains any of the refusal strings
             contains_refusal = torch.tensor([
                 any(refusal in response for refusal in refusal_strings) 
                 for response in responses_batch
