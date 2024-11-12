@@ -10,6 +10,8 @@ MODELS=(
     "lmsys/vicuna-7b-v1.5"
     "EleutherAI/pythia-6.9b"
     "EleutherAI/pythia-1b"
+    "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+    "lmsys/vicuna-13b-v1.5"
 )
 
 # Iterate over each model
@@ -36,3 +38,5 @@ for MODEL in "${MODELS[@]}"; do
         echo "Skipping $MODEL: Required files not found."
     fi
 done
+
+
