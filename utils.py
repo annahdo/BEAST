@@ -3,6 +3,8 @@ import torch.nn.functional as F
 from einops import repeat, rearrange
 from tqdm import tqdm
 import copy
+import wandb
+import re
 
 def prepare_input(chat_format, sens):        
     # assert only one user-assistant dialog
@@ -171,7 +173,7 @@ def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead
     device = model.device
 
     all_attack_sentences = []
-    all_attack_tokens = torch.empty(0, num_adv_tokens)
+    all_attack_tokens = torch.empty((0, num_adv_tokens), dtype=torch.long)
 
     for batch_prompts, batch_targets in zip(batchify(prompts, batch_size), batchify(targets, batch_size)):
         # print which batch is being processed
@@ -221,3 +223,126 @@ def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead
         all_attack_sentences.extend(final_attack_sentences)
 
     return all_attack_sentences, all_attack_tokens
+
+
+def evaluate_BEAST(model, tokenizer, adv_prompts, refusal_strings, batch_size, num_trials, do_sample, temperature, num_gen_tokens):
+    successfull_attacks = []
+    all_responses = []
+    all_refusals = []
+
+    for prompt_batch in tqdm(batchify(adv_prompts, batch_size), desc="Processing Batches"):
+        
+        refusals_batch = torch.zeros(len(prompt_batch), num_trials)
+        batch_responses = [[] for _ in range(len(prompt_batch))]  # Temporary list to store responses for the current batch
+
+        # the original paper tests for 5 different generations
+        for i in range(num_trials):
+            # Generate attacked prompts
+            responses_batch = generate(model, tokenizer, prompt_batch, max_new_tokens=num_gen_tokens, do_sample=do_sample, temperature=temperature)
+            # check if the response contains refusal strings
+                    # Check if each response contains any of the refusal strings
+            contains_refusal = torch.tensor([
+                any(refusal in response for refusal in refusal_strings) 
+                for response in responses_batch
+            ], dtype=torch.float32)
+            refusals_batch[:, i] = contains_refusal
+            # Collect responses for this trial
+            for idx, response in enumerate(responses_batch):
+                batch_responses[idx].append(response)  # Append trial response for each prompt
+
+        all_refusals.extend(refusals_batch.tolist())
+        # save the successful attacks (no refusals in any of the generations
+        successfull_attacks.extend((refusals_batch.sum(dim=1)==0).tolist())
+        all_responses.extend(batch_responses)
+
+    # calculate success rate
+    success_rate = sum(successfull_attacks) / len(successfull_attacks)
+
+    return success_rate, all_responses, all_refusals, successfull_attacks
+
+
+def logging(adv_prompts_file, successfull_attacks, adv_prompts, adv_strings, num_trials, all_responses, all_refusals, success_rate):
+    # Initialize W&B run
+    run_name = adv_prompts_file.split('/')[1].replace('_formatted_attacked_prompts.pkl', '')
+    wandb.init(project="Evaluate_BEAST", name=run_name)
+
+    # Create a W&B table for detailed tracking
+
+    response_cols = []
+    for i in range(num_trials):
+        response_cols.append(f"Response {i+1}")
+        response_cols.append(f"Response {i+1} contains refusal")
+
+    table = wandb.Table(columns=
+        ["Success", "Full adversarial Prompt", "Adversarial string found by BEAST"] + response_cols)
+
+    for success, prompt, adv_string, responses, refusals in zip(
+        successfull_attacks, adv_prompts, adv_strings, all_responses, all_refusals
+    ):
+        row = [bool(success), prompt, adv_string]  # Start with non-trial data
+        for i in range(num_trials):
+            # Add response and refusal status for each trial
+            row.append(responses[i] if i < len(responses) else None)
+            row.append(bool(refusals[i]) if i < len(refusals) else None)
+        table.add_data(*row)
+
+
+
+    # extract parameters from file name
+    # Define a regex pattern to match the parameters
+    pattern = (
+        r".*/(?P<model_name>[^/]+)_topk_(?P<top_k>None|\d+)_topp_(?P<top_p>[\d.]+)_"
+        r"k1_(?P<k1>\d+)_k2_(?P<k2>\d+)_temp_(?P<temperature>[\d.]+)_"
+        r"num_adv_tokens_(?P<num_adv_tokens>\d+)_lookahead_(?P<lookahead_length>\d+)"
+        r".*\.pkl$"
+    )
+
+    # Match the pattern against the file name
+    match = re.match(pattern, adv_prompts_file)
+
+    params = None
+    # Extract the parameters into a dictionary
+    if match:
+        params = match.groupdict()
+        # Convert numeric values to integers or floats as appropriate
+        params['model_name'] = params['model_name']
+        params["top_k"] = None if params["top_k"] == "None" else int(params["top_k"])
+        params["top_p"] = None if params["top_p"] == "None" else float(params["top_p"])
+        params["k1"] = int(params["k1"])
+        params["k2"] = int(params["k2"])
+        params["temperature"] = None if params["temperature"] == "None" else float(params["temperature"])
+        params["num_adv_tokens"] = int(params["num_adv_tokens"])
+        params["lookahead_length"] = int(params["lookahead_length"])
+        print(params)
+    else:
+        print("No match found.")
+
+    params['num_trials'] = num_trials
+    params['num_samples'] = len(adv_prompts)
+    # Log the table and success rate
+    wandb.log({"Adversarial Results": table})
+    # Log parameters
+    wandb.config.update(params)
+
+    # Log the success rate as a scalar
+    wandb.run.summary["Success Rate"] = success_rate
+
+    for p in params:
+        wandb.run.summary[p] = params[p]
+
+    summary_note = (
+        f"This experiment tests adversarial prompts with the {params['model_name']} model.\n"
+        f"Success rate: {success_rate}\n"
+        f"Number of samples tested: {params['num_samples']}\n"
+        "Key parameters:\n"
+        f"\t num_trials: {params['num_trials']}\n"
+        f"\t temperature: {params['temperature']}\n"
+        f"\t num_adv_tokens: {params['num_adv_tokens']}\n"
+        f"\t lookahead_length: {params['lookahead_length']}\n"
+    )
+
+    # Log the summary note
+    wandb.run.notes = summary_note
+
+    # Finish W&B run
+    wandb.finish()

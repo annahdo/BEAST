@@ -12,3 +12,4 @@ ipykernel
 jupyter
 ipywidgets==7.7.1
 einops
+wandb
