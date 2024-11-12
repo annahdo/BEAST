@@ -75,7 +75,7 @@ def calc_perplexity(input_tokens, total_tokens, model, batch_size=16):
 
     sl_input_tokens = input_tokens['input_ids'].shape[1]
     
-    for input_ids_batch, input_attention_mask_batch in zip(batchify(total_tokens['input_ids'], batch_size), batchify(total_tokens['attention_mask'], 16)):
+    for input_ids_batch, input_attention_mask_batch in zip(batchify(total_tokens['input_ids'], batch_size), batchify(total_tokens['attention_mask'], batch_size)):
 
 
         num_samples, sl_total_tokens = input_ids_batch.shape
@@ -178,7 +178,6 @@ def attack_BEAST(tokenizer, model, prompts, targets, assistant_string, lookahead
     for batch_prompts, batch_targets in zip(batchify(prompts, batch_size), batchify(targets, batch_size)):
         # print which batch is being processed
         print(f"Processing batch {len(all_attack_sentences)//batch_size + 1} of {(len(prompts) + batch_size - 1) // batch_size}")
-
         # target tokens repeated
         target_tokens = get_target_tokens(tokenizer, batch_targets, lookahead_length).to(device)
         target_tokens_expanded = repeat(target_tokens['input_ids'], 'b t -> b r t', r=k1*k2)
